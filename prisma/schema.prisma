@@ -1,0 +1,528 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+//////////////////////////////////////////////////////
+// ENUMS
+//////////////////////////////////////////////////////
+
+enum UserRole {
+  RESIDENT
+  WORKER
+  ADMIN
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+}
+
+enum PickupType {
+  NORMAL
+  URGENT
+}
+
+enum UserStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum ServiceType {
+  IRON
+  PLUMBING
+  MAID
+  CAR_CLEANING
+}
+
+enum RequestStatus {
+  PENDING
+  ACCEPTED
+  CONFIRMED
+  VISITED
+  QUOTED
+  IN_PROGRESS
+  COMPLETED
+  REJECTED
+  CANCELLED
+  EXPIRED
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+//////////////////////////////////////////////////////
+// APARTMENT
+//////////////////////////////////////////////////////
+
+model Apartment {
+  id           String  @id @default(uuid())
+  name         String
+  code         String? @unique
+  address      String?
+  city         String?
+  state        String?
+  country      String?
+  contactPhone String?
+  isActive     Boolean @default(true)
+
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  ironPricing IronPricing[]
+
+  blocks      Block[]
+  users       User[]
+  requests    ServiceRequest[]
+  pickupSlots PickupSlot[]
+}
+
+//////////////////////////////////////////////////////
+// BLOCK
+//////////////////////////////////////////////////////
+
+model Block {
+  id          String @id @default(uuid())
+  name        String
+  apartmentId String
+
+  apartment   Apartment        @relation(fields: [apartmentId], references: [id])
+  flats       Flat[]
+  assignments WorkerBlock[]
+  requests    ServiceRequest[]
+
+  createdAt DateTime @default(now())
+
+  @@unique([name, apartmentId])
+  @@index([apartmentId])
+}
+
+//////////////////////////////////////////////////////
+// FLAT
+//////////////////////////////////////////////////////
+
+model Flat {
+  id      String @id @default(uuid())
+  number  String
+  blockId String
+
+  block Block @relation(fields: [blockId], references: [id])
+
+  resident User? @relation("FlatResident")
+
+  // 🔥 Flat-based worker assignment (One flat → One worker)
+  workerAssignment WorkerFlat?
+
+  requests ServiceRequest[]
+
+  createdAt DateTime @default(now())
+
+  @@unique([number, blockId])
+  @@index([blockId])
+}
+
+//////////////////////////////////////////////////////
+// WORKER ↔ BLOCK ASSIGNMENT (Optional)
+//////////////////////////////////////////////////////
+
+model WorkerBlock {
+  id       String @id @default(uuid())
+  workerId String
+  blockId  String
+
+  worker User  @relation(fields: [workerId], references: [id])
+  block  Block @relation(fields: [blockId], references: [id])
+
+  @@unique([workerId, blockId])
+  @@index([workerId])
+  @@index([blockId])
+}
+
+//////////////////////////////////////////////////////
+// WORKER ↔ FLAT ASSIGNMENT (PRIMARY WORKER)
+//////////////////////////////////////////////////////
+
+model WorkerFlat {
+  id       String @id @default(uuid())
+  workerId String
+  flatId   String @unique // 🔥 One flat → One worker
+
+  worker User @relation(fields: [workerId], references: [id])
+  flat   Flat @relation(fields: [flatId], references: [id])
+}
+
+//////////////////////////////////////////////////////
+// USER
+//////////////////////////////////////////////////////
+
+model User {
+  id           String   @id @default(uuid())
+  name         String
+  phone        String
+  email        String?
+  passwordHash String?
+  role         UserRole
+  apartmentId  String
+  flatNumber   String?
+  profileImage String?
+  fcmToken     String?
+
+  isActive        Boolean    @default(false)
+  lastLoginAt     DateTime?
+  status          UserStatus @default(PENDING)
+  rejectionReason String?
+  actionAt        DateTime?
+
+  dailyCapacities WorkerDailyCapacity[]
+  pickupSlots     PickupSlot[]
+
+  flatId String? @unique
+  flat   Flat?   @relation("FlatResident", fields: [flatId], references: [id])
+
+  assignedBlocks WorkerBlock[]
+  assignedFlats  WorkerFlat[]
+
+  statusLogs RequestStatusLog[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  apartment     Apartment      @relation(fields: [apartmentId], references: [id])
+  workerProfile WorkerProfile?
+
+  requests      ServiceRequest[] @relation("ResidentRequests")
+  assignedJobs  ServiceRequest[] @relation("WorkerRequests")
+  notifications Notification[]
+
+  residentChats ChatRoom[]    @relation("ResidentChats")
+  workerChats   ChatRoom[]    @relation("WorkerChats")
+  sentMessages  ChatMessage[]
+
+  @@unique([phone, apartmentId])
+  @@index([apartmentId])
+  @@index([role])
+  @@index([status])
+}
+
+//////////////////////////////////////////////////////
+// WORKER PROFILE
+//////////////////////////////////////////////////////
+
+model WorkerProfile {
+  id                 String      @id @default(uuid())
+  userId             String      @unique
+  service            ServiceType
+  experienceYears    Int?
+  rating             Float?      @default(0)
+  totalCompletedJobs Int?        @default(0)
+  isActive           Boolean     @default(true)
+  isAvailable        Boolean     @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+//////////////////////////////////////////////////////
+// WorkerDailyCapacity
+//////////////////////////////////////////////////////
+
+model WorkerDailyCapacity {
+  id         String   @id @default(uuid())
+  workerId   String
+  date       DateTime
+  totalLimit Int
+  usedLimit  Int      @default(0)
+  isActive   Boolean  @default(true)
+
+  worker User @relation(fields: [workerId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@unique([workerId, date])
+  @@index([workerId])
+}
+
+//////////////////////////////////////////////////////
+// PickupSlot
+//////////////////////////////////////////////////////
+
+model PickupSlot {
+  id          String     @id @default(uuid())
+  workerId    String
+  apartmentId String
+  date        DateTime
+  startTime   DateTime
+  endTime     DateTime
+  type        PickupType
+
+  maxCapacity  Int
+  usedCapacity Int @default(0)
+
+  isActive Boolean @default(true)
+
+  worker    User      @relation(fields: [workerId], references: [id])
+  apartment Apartment @relation(fields: [apartmentId], references: [id])
+
+  requests ServiceRequest[]
+
+  createdAt DateTime @default(now())
+
+  @@index([workerId])
+  @@index([date])
+  @@index([type])
+}
+
+//////////////////////////////////////////////////////
+// SERVICE REQUEST
+//////////////////////////////////////////////////////
+
+model ServiceRequest {
+  id          String  @id @default(uuid())
+  apartmentId String
+  residentId  String
+  workerId    String?
+
+  flatId  String
+  blockId String?
+
+  acceptedAt DateTime?
+  visitedAt  DateTime?
+  quotedAt   DateTime?
+
+  completedAt DateTime?
+
+  serviceType       ServiceType
+  priority          Priority      @default(MEDIUM)
+  title             String?
+  details           String
+  estimatedDuration Int?
+  flatNumber        String?
+  status            RequestStatus @default(PENDING)
+
+  isEscalated Boolean @default(false)
+
+  reason    String?
+  startedAt DateTime?
+
+  visitCharge    Float?
+  materialCharge Float?
+  plumberQuote   PlumberQuote?
+
+  payment Payment?
+
+  plumberDetails PlumberDetails?
+
+  pickupSlotId String?
+  pickupSlot   PickupSlot? @relation(fields: [pickupSlotId], references: [id])
+
+  pickupType PickupType?
+  pickupDate DateTime?
+
+  requestedClothes Int?
+  confirmedClothes Int?
+  bagColor         String?
+
+  totalAmount Int?       @default(0)
+  ironItems   IronItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  isDeletedByResident Boolean @default(false)
+  isDeletedByWorker   Boolean @default(false)
+
+  apartment Apartment @relation(fields: [apartmentId], references: [id])
+  resident  User      @relation("ResidentRequests", fields: [residentId], references: [id])
+  worker    User?     @relation("WorkerRequests", fields: [workerId], references: [id])
+  block     Block?    @relation(fields: [blockId], references: [id])
+  flat      Flat      @relation(fields: [flatId], references: [id])
+
+  logs RequestStatusLog[]
+
+  chatRoom ChatRoom?
+
+  @@index([apartmentId])
+  @@index([residentId])
+  @@index([workerId])
+  @@index([status])
+  @@index([createdAt])
+  @@index([blockId])
+  @@index([flatId])
+  @@index([serviceType])
+  @@index([isEscalated])
+}
+
+//////////////////////////////////////////////////////
+// NOTIFICATIONS
+//////////////////////////////////////////////////////
+
+model Notification {
+  id          String   @id @default(uuid())
+  userId      String
+  title       String
+  body        String
+  type        String?
+  referenceId String?
+  isRead      Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+}
+
+//////////////////////////////////////////////////////
+// REQUEST STATUS LOG
+//////////////////////////////////////////////////////
+
+model RequestStatusLog {
+  id              String        @id @default(uuid())
+  requestId       String
+  oldStatus       RequestStatus
+  newStatus       RequestStatus
+  changedByUserId String
+  note            String?
+  changedAt       DateTime      @default(now())
+
+  request ServiceRequest @relation(fields: [requestId], references: [id])
+
+  changedByUser User @relation(fields: [changedByUserId], references: [id])
+
+  @@index([requestId])
+}
+
+//////////////////////////////////////////////////////
+// IronItem
+//////////////////////////////////////////////////////
+
+model IronItem {
+  id           String @id @default(uuid())
+  requestId    String
+  clothType    String
+  quantity     Int
+  pricePerUnit Int
+
+  request ServiceRequest @relation(fields: [requestId], references: [id])
+
+  @@index([requestId])
+}
+
+//////////////////////////////////////////////////////
+// IronPricing
+//////////////////////////////////////////////////////
+
+model IronPricing {
+  id          String @id @default(uuid())
+  apartmentId String
+  clothType   String
+  price       Int
+
+  apartment Apartment @relation(fields: [apartmentId], references: [id])
+
+  @@unique([apartmentId, clothType])
+}
+
+//////////////////////////////////////////////////////
+// ChatRoom
+//////////////////////////////////////////////////////
+
+model ChatRoom {
+  id         String @id @default(uuid())
+  requestId  String @unique
+  residentId String
+  workerId   String
+
+  createdAt DateTime @default(now())
+
+  request  ServiceRequest @relation(fields: [requestId], references: [id])
+  resident User           @relation("ResidentChats", fields: [residentId], references: [id])
+  worker   User           @relation("WorkerChats", fields: [workerId], references: [id])
+
+  messages ChatMessage[]
+
+  @@index([residentId])
+  @@index([workerId])
+}
+
+//////////////////////////////////////////////////////
+// ChatMessage
+//////////////////////////////////////////////////////
+
+model ChatMessage {
+  id         String  @id @default(uuid())
+  chatRoomId String
+  senderId   String
+  message    String
+  type       String  @default("TEXT") // TEXT / IMAGE
+  isEdited   Boolean @default(false)
+  isDeleted  Boolean @default(false)
+
+  deliveredAt DateTime?
+  seenAt      DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  chatRoom ChatRoom @relation(fields: [chatRoomId], references: [id])
+  sender   User     @relation(fields: [senderId], references: [id])
+
+  @@index([chatRoomId])
+}
+
+model Payment {
+  id                String        @id @default(uuid())
+  requestId         String        @unique
+  residentId        String
+  workerId          String
+  amount            Int @default(0)
+  status            PaymentStatus @default(PENDING)
+  razorpayOrderId   String?
+  razorpayPaymentId String?
+  createdAt         DateTime      @default(now())
+  paidAt            DateTime?
+
+  request ServiceRequest @relation(fields: [requestId], references: [id])
+
+  @@index([residentId])
+  @@index([workerId])
+}
+
+model PlumberDetails {
+  id               String   @id @default(uuid())
+  requestId        String   @unique
+  problemTitle     String
+  description      String
+  visitCharge      Int?
+  materialCharge   Int?
+  finalAmount      Int?
+  residentApproved Boolean  @default(false)
+  photos           String[] @default([])
+  note             String?
+
+  request ServiceRequest @relation(fields: [requestId], references: [id])
+}
+
+model PlumberQuote {
+  id        String @id @default(cuid())
+  requestId String @unique
+
+  visitCharge    Int
+  materialCharge Int
+  totalAmount    Int
+  note           String?
+
+  createdAt DateTime @default(now())
+
+  request ServiceRequest @relation(fields: [requestId], references: [id])
+}
