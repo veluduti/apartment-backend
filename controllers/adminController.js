@@ -6,6 +6,7 @@ exports.getPendingUsers = async (req, res) => {
 
     const users = await prisma.user.findMany({
       where: {
+        apartmentId: req.user.apartmentId,
         status: "PENDING",
         role: {
           in: ["RESIDENT", "WORKER"]
@@ -36,7 +37,6 @@ exports.getPendingUsers = async (req, res) => {
   }
 };
 
-
 // ================= APPROVE USER =================
 
 exports.approveUser = async (req, res) => {
@@ -47,6 +47,13 @@ exports.approveUser = async (req, res) => {
     const user = await prisma.user.findUnique({
       where: { id }
     });
+    
+    if (!user || user.apartmentId !== req.user.apartmentId) {
+      return res.status(403).json({
+        success: false,
+        message: "Unauthorized action"
+      });
+    }
 
     await prisma.user.update({
       where: { id },
@@ -113,7 +120,7 @@ exports.assignFlatToWorker = async (req, res) => {
       where: { id: workerId }
     });
 
-    if (!worker || worker.role !== "WORKER") {
+    if (!worker || worker.role !== "WORKER" || worker.apartmentId !== req.user.apartmentId) {
       return res.json({
         success: false,
         message: "Invalid worker"
@@ -125,10 +132,10 @@ exports.assignFlatToWorker = async (req, res) => {
       where: { id: flatId }
     });
 
-    if (!flat) {
+    if (!flat || flat.apartmentId !== req.user.apartmentId) {
       return res.json({
         success: false,
-        message: "Flat not found"
+        message: "Unauthorized flat access"
       });
     }
 
@@ -172,6 +179,17 @@ exports.rejectUser = async (req, res) => {
       });
     }
 
+    const user = await prisma.user.findUnique({
+      where: { id }
+    });
+
+    if (!user || user.apartmentId !== req.user.apartmentId) {
+      return res.status(403).json({
+        success: false,
+        message: "Unauthorized action"
+      });
+    }
+
     await prisma.user.update({
       where: { id },
       data: {
@@ -204,6 +222,7 @@ exports.getUserHistory = async (req, res) => {
     const { role } = req.query;
 
     const whereCondition = {
+      apartmentId: req.user.apartmentId,
       status: {
         in: ["APPROVED", "REJECTED"]
       },

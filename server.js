@@ -29,6 +29,8 @@ const ironRoutes = require("./routes/ironRoutes");
 const paymentRoutes = require("./routes/paymentRoutes");
 const plumberRoutes = require("./routes/plumberRoutes");
 const translateRoutes = require("./routes/translateRoutes");
+const apartmentRoutes = require("./routes/apartmentRoutes");
+
 
 const app = express();
 const server = http.createServer(app);
@@ -129,6 +131,7 @@ app.use("/api/plumber", plumberRoutes);
 app.use("/api/translate", translateRoutes);
 app.use("/upload", uploadRoutes);
 app.use("/uploads", express.static("uploads"));
+app.use("/api/apartments", apartmentRoutes);
 
 
 // ===============================

@@ -6,7 +6,6 @@ const userModel = require("../models/userModel");
 const createRequest = (req, res) => {
 
   const {
-    apartmentId,
     serviceType,
     residentId,
     residentName,
@@ -15,7 +14,9 @@ const createRequest = (req, res) => {
     details
   } = req.body;
 
-  if (!apartmentId || !serviceType || !residentId || !details) {
+  const apartmentId = req.user.apartmentId; // 🔥 FIX
+
+  if (!serviceType || !residentId || !details) {
     return res.status(400).json({
       success: false,
       message: "Missing required fields"
@@ -23,7 +24,7 @@ const createRequest = (req, res) => {
   }
 
   const request = requestModel.createRequest({
-    apartmentId,
+    apartmentId, // 🔥 always from token
     serviceType,
     residentId,
     residentName,
@@ -39,16 +40,16 @@ const createRequest = (req, res) => {
 };
 
 
-// 🔹 Get All Requests (Apartment Wise)
+// 🔹 Get All Requests (SECURE)
 const getRequests = (req, res) => {
 
-  const { apartmentId } = req.query;
+  const apartmentId = req.user.apartmentId; // 🔥 FIX
 
   const allRequests = requestModel.getAllRequests();
 
-  const filtered = apartmentId
-    ? allRequests.filter(r => r.apartmentId === apartmentId)
-    : allRequests;
+  const filtered = allRequests.filter(
+    r => r.apartmentId === apartmentId
+  );
 
   res.json({
     success: true,
@@ -57,10 +58,11 @@ const getRequests = (req, res) => {
 };
 
 
-// 🔹 Accept Request (Assign Worker)
+// 🔹 Accept Request
 const acceptRequest = (req, res) => {
 
   const { requestId, workerId } = req.body;
+  const apartmentId = req.user.apartmentId;
 
   if (!requestId || !workerId) {
     return res.status(400).json({
@@ -69,8 +71,19 @@ const acceptRequest = (req, res) => {
     });
   }
 
+  const request = requestModel.getAllRequests()
+    .find(r => r.id === requestId);
+
+  // 🔥 SECURITY CHECK
+  if (!request || request.apartmentId !== apartmentId) {
+    return res.status(403).json({
+      success: false,
+      message: "Unauthorized access"
+    });
+  }
+
   const worker = userModel.getWorkersByService("")
-    .find(w => w.id === workerId);
+    .find(w => w.id === workerId && w.apartmentId === apartmentId);
 
   if (!worker) {
     return res.status(404).json({
@@ -87,13 +100,6 @@ const acceptRequest = (req, res) => {
     acceptedAt: new Date()
   });
 
-  if (!updated) {
-    return res.status(404).json({
-      success: false,
-      message: "Request not found"
-    });
-  }
-
   res.json({
     success: true,
     data: updated
@@ -101,15 +107,27 @@ const acceptRequest = (req, res) => {
 };
 
 
-// 🔹 Update Status (Start Work / Complete)
+// 🔹 Update Status
 const updateStatus = (req, res) => {
 
   const { requestId, status } = req.body;
+  const apartmentId = req.user.apartmentId;
 
   if (!requestId || !status) {
     return res.status(400).json({
       success: false,
       message: "Missing requestId or status"
+    });
+  }
+
+  const request = requestModel.getAllRequests()
+    .find(r => r.id === requestId);
+
+  // 🔥 SECURITY CHECK
+  if (!request || request.apartmentId !== apartmentId) {
+    return res.status(403).json({
+      success: false,
+      message: "Unauthorized access"
     });
   }
 
@@ -125,13 +143,6 @@ const updateStatus = (req, res) => {
 
   const updated = requestModel.updateRequest(requestId, updates);
 
-  if (!updated) {
-    return res.status(404).json({
-      success: false,
-      message: "Request not found"
-    });
-  }
-
   res.json({
     success: true,
     data: updated
@@ -143,18 +154,23 @@ const updateStatus = (req, res) => {
 const rejectRequest = (req, res) => {
 
   const { requestId, reason } = req.body;
+  const apartmentId = req.user.apartmentId;
+
+  const request = requestModel.getAllRequests()
+    .find(r => r.id === requestId);
+
+  // 🔥 SECURITY CHECK
+  if (!request || request.apartmentId !== apartmentId) {
+    return res.status(403).json({
+      success: false,
+      message: "Unauthorized access"
+    });
+  }
 
   const updated = requestModel.updateRequest(requestId, {
     status: "Rejected",
     rejectionReason: reason || null
   });
-
-  if (!updated) {
-    return res.status(404).json({
-      success: false,
-      message: "Request not found"
-    });
-  }
 
   res.json({
     success: true,

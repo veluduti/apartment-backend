@@ -11,7 +11,7 @@ function normalizePhone(phone) {
     return phone;
   }
 
-  return "+91" + phone; // Default India
+  return "+91" + phone;
 }
 
 // ====================================================
@@ -24,7 +24,7 @@ exports.registerUser = async (req, res) => {
       phone,
       email,
       role,
-      apartmentId,
+      apartmentId, // 🔥 allowed (public API)
       flatId
     } = req.body;
 
@@ -34,6 +34,18 @@ exports.registerUser = async (req, res) => {
       return res.json({
         success: false,
         message: "Required fields missing"
+      });
+    }
+
+    // 🔥 Validate apartment exists (optional but good)
+    const apartment = await prisma.apartment.findUnique({
+      where: { id: apartmentId }
+    });
+
+    if (!apartment) {
+      return res.json({
+        success: false,
+        message: "Invalid apartment"
       });
     }
 
@@ -49,9 +61,7 @@ exports.registerUser = async (req, res) => {
       });
     }
 
-    // ====================================================
-    // ================= RESIDENT ==========================
-    // ====================================================
+    // ================= RESIDENT =================
     if (role === "RESIDENT") {
 
       if (!flatId) {
@@ -61,30 +71,24 @@ exports.registerUser = async (req, res) => {
         });
       }
 
-      // Wrap in transaction to avoid partial data
       await prisma.$transaction(async (tx) => {
 
         const flat = await tx.flat.findUnique({
           where: { id: flatId }
         });
 
-        if (!flat) {
+        if (!flat || flat.apartmentId !== apartmentId) {
           throw new Error("Invalid flat selected");
         }
 
-        // if (flat.userId) {
-        //   throw new Error("Flat already occupied");
-        // }
-
-        // Create resident
-        const newUser = await tx.user.create({
+        await tx.user.create({
           data: {
             name,
             phone,
             email: email || null,
             role,
             apartmentId,
-            flatId: flatId,
+            flatId,
             flatNumber: flat.number,
             isActive: false,
             status: "PENDING"
@@ -99,9 +103,7 @@ exports.registerUser = async (req, res) => {
       });
     }
 
-    // ====================================================
-    // ================= WORKER ============================
-    // ====================================================
+    // ================= WORKER =================
     if (role === "WORKER") {
 
       await prisma.user.create({
@@ -122,11 +124,10 @@ exports.registerUser = async (req, res) => {
       });
     }
 
-    // ====================================================
-    // ================= ADMIN (SAFE) ======================
-    // ====================================================
+    // ================= ADMIN =================
     if (role === "ADMIN") {
 
+      // 🔥 Only SUPER_ADMIN should create ADMIN (enforce later in routes)
       await prisma.user.create({
         data: {
           name,
@@ -197,22 +198,37 @@ exports.loginUser = async (req, res) => {
 
     phone = normalizePhone(phone);
 
-    if (!phone || !apartmentId) {
+    if (!phone) {
       return res.json({
         success: false,
-        message: "Phone and apartment required"
+        message: "Phone required"
       });
     }
 
-    const user = await prisma.user.findFirst({
-  where: {
-    phone,
-    apartmentId
-  },
-  include: {
-    workerProfile: true
-  }
-});
+    let user = null;
+
+    // 🔥 Normal user
+    if (apartmentId) {
+      user = await prisma.user.findFirst({
+        where: {
+          phone,
+          apartmentId
+        },
+        include: {
+          workerProfile: true
+        }
+      });
+    }
+
+    // 🔥 SUPER_ADMIN fallback
+    if (!user) {
+      user = await prisma.user.findFirst({
+        where: {
+          phone,
+          role: "SUPER_ADMIN"
+        }
+      });
+    }
 
     if (!user) {
       return res.json({
@@ -221,7 +237,7 @@ exports.loginUser = async (req, res) => {
       });
     }
 
-    if (!user.isActive) {
+    if (user.role !== "SUPER_ADMIN" && !user.isActive) {
       return res.json({
         success: false,
         message: "Await admin approval"
@@ -231,7 +247,8 @@ exports.loginUser = async (req, res) => {
     const token = jwt.sign(
       {
         userId: user.id,
-        role: user.role
+        role: user.role,
+        apartmentId: user.apartmentId
       },
       process.env.JWT_SECRET,
       { expiresIn: "7d" }
@@ -241,14 +258,14 @@ exports.loginUser = async (req, res) => {
       success: true,
       token,
       user: {
-  id: user.id,
-  name: user.name,
-  role: user.role,
-  apartmentId: user.apartmentId,
-  flatNumber: user.flatNumber,
-  flatId: user.flatId,
-  workerProfile: user.workerProfile   // ✅ ADD THIS
-}
+        id: user.id,
+        name: user.name,
+        role: user.role,
+        apartmentId: user.apartmentId,
+        flatNumber: user.flatNumber,
+        flatId: user.flatId,
+        workerProfile: user.workerProfile || null
+      }
     });
 
   } catch (error) {
