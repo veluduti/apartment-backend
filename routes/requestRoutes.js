@@ -1,3 +1,4 @@
+const { addIronItems } = require("../controllers/requestController");
 const express = require("express");
 const { PrismaClient } = require("@prisma/client");
 const admin = require("../firebase");
@@ -6,6 +7,26 @@ const { getService } = require("../services/registry/serviceRegistry");
 const router = express.Router();
 const prisma = new PrismaClient();
 
+function canEditRequest(request) {
+
+  // ✅ Status check
+  if (!["PENDING", "ACCEPTED"].includes(request.status)) {
+    return false;
+  }
+
+  // ✅ Slot must exist
+  if (!request.pickupSlot || !request.pickupSlot.startTime) {
+    return false;
+  }
+
+  const now = new Date();
+  const slotStart = new Date(request.pickupSlot.startTime);
+
+  // ⏱️ 30 minutes before slot
+  const cutoff = new Date(slotStart.getTime() - 30 * 60 * 1000);
+
+  return now < cutoff;
+}
 
 // =================================
 // CREATE REQUEST
@@ -147,123 +168,136 @@ router.get("/", async (req, res) => {
       };
     }
 
-    if (role === "worker") {
-
-      const worker = await prisma.user.findUnique({
-        where: { id: userId },
-        include: {
-          workerProfile: true,
-          assignedFlats: true,
-        },
-      });
-      const service = worker.workerProfile?.service;
-
-      if (!worker) {
-        return res.json({ success: true, data: [] });
-      }
-
-      // =============================
-// IRON SERVICE → ASSIGNED WORKER
 // =============================
-if (service === "IRON") {
+// WORKER LOGIC
+// =============================
+let worker = null;
 
-  const assignedFlatIds = worker.assignedFlats.map(f => f.flatId);
+if (role === "worker") {
 
-  where = {
-    apartmentId,
-    isDeletedByWorker: false,
-    serviceType: "IRON",
+  worker = await prisma.user.findUnique({
+    where: { id: userId },
+    include: {
+      workerProfile: true,
+      assignedFlats: true
+    }
+  });
 
-    OR: [
-      {
-        flatId: { in: assignedFlatIds },
-        status: "PENDING",
-        isEscalated: false
-      },
-      {
-        status: "PENDING",
-        isEscalated: true,
-        workerId: null,
-        NOT: {
-          logs: {
-            some: {
-              changedByUserId: userId,
-              newStatus: "REJECTED"
+  if (!worker || worker.role !== "WORKER") {
+    return res.json({
+      success: true,
+      data: [],
+      edits: []
+    });
+  }
+
+  const service = worker.workerProfile?.service;
+
+if (!service) {
+  return res.json({
+    success: true,
+    data: [],
+    edits: []
+  });
+}
+
+  // =============================
+  // IRON SERVICE → ASSIGNED WORKER
+  // =============================
+  if (service === "IRON") {
+
+    const assignedFlatIds = (worker.assignedFlats || []).map(f => f.flatId);
+
+    where = {
+      apartmentId,
+      isDeletedByWorker: false,
+      serviceType: "IRON",
+
+      OR: [
+        {
+          flatId: { in: assignedFlatIds },
+          status: "PENDING",
+          isEscalated: false
+        },
+        {
+          status: "PENDING",
+          isEscalated: true,
+          workerId: null,
+          NOT: {
+            logs: {
+              some: {
+                changedByUserId: userId,
+                newStatus: "REJECTED"
+              }
             }
           }
+        },
+        {
+          workerId: userId
         }
-      },
-      {
-        workerId: userId
-      }
-    ]
-  };
+      ]
+    };
+  }
 
+  // =============================
+  // PLUMBING → FIRST ACCEPT MODEL
+  // =============================
+  else if (service === "PLUMBING") {
+
+    where = {
+      apartmentId,
+      isDeletedByWorker: false,
+      serviceType: "PLUMBING",
+
+      OR: [
+        {
+          status: "PENDING",
+          workerId: null
+        },
+        {
+          workerId: userId
+        }
+      ]
+    };
+  }
 }
 
 // =============================
-// PLUMBING → FIRST ACCEPT MODEL
+// FETCH REQUESTS
 // =============================
-else if (service === "PLUMBING") {
-
-  where = {
-    apartmentId,
-    isDeletedByWorker: false,
-    serviceType: "PLUMBING",
-
-    OR: [
-
-      // show all new plumbing requests
-      {
-        status: "PENDING",
-        workerId: null
-      },
-
-      // show jobs already accepted by this worker
-      {
-        workerId: userId
+const requests = await prisma.serviceRequest.findMany({
+  where,
+  include: {
+    resident: true,
+    worker: {
+      select: {
+        id: true,
+        name: true,
+        phone: true
       }
-
-    ]
-  };
-
-}
+    },
+    pickupSlot: true,
+    ironItems: true,
+    payment: true,
+    plumberDetails: {
+      select: {
+        problemTitle: true,
+        note: true,
+        photos: true,
+        visitCharge: true,
+        materialCharge: true
+      }
+    },
+    flat: {
+      select: { number: true }
+    },
+    logs: {
+      include: { changedByUser: true },
+      orderBy: { changedAt: "asc" }
     }
-
-    const requests = await prisma.serviceRequest.findMany({
-      where,
-      include: {
-        resident: true,
-        worker: {
-          select: {
-            id: true,
-            name: true,
-            phone: true
-          }
-        },
-        pickupSlot: true,
-        ironItems: true,
-        payment: true,
-        plumberDetails: {
-          select: {
-            problemTitle: true,
-            note: true,
-            photos: true,
-            visitCharge: true,
-            materialCharge: true
-          }
-        },
-        
-        flat: {
-          select: { number: true }
-        },
-        logs: {
-          include: { changedByUser: true },
-          orderBy: { changedAt: "asc" }
-        }
-      },
-      orderBy: { createdAt: "desc" },
-    });
+  },
+  orderBy: { createdAt: "desc" },
+});
 
 
 // ======================================
@@ -281,10 +315,16 @@ else if (service === "PLUMBING") {
           continue;
         }
 
-        if (!reqItem.isEscalated) {
-          filtered.push(reqItem);
-          continue;
-        }
+        // Only show assigned flats if NOT escalated
+    if (!reqItem.isEscalated) {
+      if (
+        reqItem.flatId &&
+        (worker.assignedFlats || []).some(f => f.flatId === reqItem.flatId)
+      ) {
+        filtered.push(reqItem);
+      }
+      continue;
+    }
 
         if (reqItem.status !== "PENDING") continue;
 
@@ -348,10 +388,41 @@ else if (service === "PLUMBING") {
 
       }
 
-      return res.json({ success: true, data: filtered });
+      const edits = await prisma.requestEdit.findMany({
+        where: {
+          status: "PENDING",
+          OR: [
+            {
+              request: {
+                workerId: userId
+              }
+            },
+            {
+              request: {
+                workerId: null,
+                serviceType: "IRON"
+              }
+            }
+          ]
+        },
+        include: {
+          request: true
+        }
+      });
+
+      return res.json({
+        success: true,
+        data: filtered,
+        edits
+      });
     }
 
-    res.json({ success: true, data: requests });
+    const enriched = requests.map(r => ({
+      ...r,
+      canEdit: canEditRequest(r)
+    }));
+
+    res.json({ success: true, data: enriched });
 
   } catch (error) {
     console.error("GET ERROR:", error);
@@ -686,5 +757,238 @@ router.post("/save-token", async (req, res) => {
     });
   }
 });
+
+router.put("/:requestId/add-items", addIronItems);
+
+router.post("/edit-items", async (req, res) => {
+  try {
+    const { requestId, items } = req.body;
+
+    if (!items || items.length === 0) {
+      return res.json({ success: false, message: "No items" });
+    }
+
+    // 🚫 prevent multiple pending edits
+    const existing = await prisma.requestEdit.findFirst({
+      where: {
+        requestId,
+        status: "PENDING"
+      }
+    });
+
+    if (existing) {
+      return res.json({
+        success: false,
+        message: "Already pending approval"
+      });
+    }
+
+    // ✅ create edit request
+    const edit = await prisma.requestEdit.create({
+      data: {
+        requestId,
+        items,
+        status: "PENDING"
+      }
+    });
+
+    // 🔔 notify worker
+    const request = await prisma.serviceRequest.findUnique({
+      where: { id: requestId },
+      include: { worker: true }
+    });
+
+    if (request?.worker?.fcmToken) {
+      await admin.messaging().send({
+        token: request.worker.fcmToken,
+        notification: {
+          title: "Edit Request",
+          body: "Resident updated clothes. Please review."
+        }
+      });
+    }
+
+    res.json({ success: true });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false });
+  }
+});
+
+// =================================
+// APPROVE EDIT
+// =================================
+router.post("/edit/approve", async (req, res) => {
+  try {
+    const io = req.app.get("io"); // ✅ HERE
+    const { editId, userId } = req.body;
+
+    const edit = await prisma.requestEdit.findUnique({
+      where: { id: editId },
+      include: { request: true }
+    });
+
+    // ✅ SECURITY CHECK
+    if (!edit || edit.request.workerId !== userId) {
+      return res.json({ success: false, message: "Unauthorized" });
+    }
+
+    // 🔥 APPLY ITEMS
+    await addIronItemsLogic(edit.requestId, edit.items);
+
+    await prisma.requestEdit.update({
+      where: { id: editId },
+      data: { status: "APPROVED" }
+    });
+
+    io.emit("editResponse", {
+      requestId: edit.requestId,
+      residentId: edit.request.residentId,
+      approved: true
+    });
+
+    // 🔥🔥 ADD THIS LINE HERE
+    io.emit("requestUpdated", {
+      requestId: edit.requestId
+    });
+
+    // ===============================
+    // 🔔 NOTIFY RESIDENT (ADD HERE)
+    // ===============================
+    const request = await prisma.serviceRequest.findUnique({
+      where: { id: edit.requestId },
+      include: { resident: true }
+    });
+
+    if (request?.resident?.fcmToken) {
+      await admin.messaging().send({
+        token: request.resident.fcmToken,
+        notification: {
+          title: "Edit Approved",
+          body: "Your updated clothes have been approved"
+        }
+      });
+    }
+
+    // ===============================
+    // RESPONSE
+    // ===============================
+    res.json({ success: true });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false });
+  }
+});
+
+// =================================
+// REJECT EDIT
+// =================================
+router.post("/edit/reject", async (req, res) => {
+  try {
+    const { editId, userId } = req.body;
+
+    const edit = await prisma.requestEdit.findUnique({
+      where: { id: editId },
+      include: { request: true }
+    });
+
+    if (!edit || edit.request.workerId !== userId) {
+      return res.json({ success: false, message: "Unauthorized" });
+    }
+
+    // ✅ Update status
+    await prisma.requestEdit.update({
+      where: { id: editId },
+      data: { status: "REJECTED" }
+    });
+
+    io.emit("editResponse", {
+      requestId: edit.requestId,
+      residentId: edit.request.residentId,
+      approved: false
+    });
+
+    // 🔥🔥 ADD THIS LINE HERE
+    io.emit("requestUpdated", {
+      requestId: edit.requestId
+    });
+
+    // ===============================
+    // 🔔 NOTIFY RESIDENT (MOVE HERE)
+    // ===============================
+    const request = await prisma.serviceRequest.findUnique({
+      where: { id: edit.requestId },
+      include: { resident: true }
+    });
+
+    if (request?.resident?.fcmToken) {
+      await admin.messaging().send({
+        token: request.resident.fcmToken,
+        notification: {
+          title: "Edit Rejected",
+          body: "Worker rejected your changes"
+        }
+      });
+    }
+
+    res.json({ success: true });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false });
+  }
+});
+
+async function addIronItemsLogic(requestId, items) {
+
+  const request = await prisma.serviceRequest.findUnique({
+    where: { id: requestId }
+  });
+
+  const pricing = await prisma.ironPricing.findMany({
+    where: { apartmentId: request.apartmentId }
+  });
+
+  const priceMap = {};
+  pricing.forEach(p => {
+    priceMap[p.clothType] = p.price;
+  });
+
+  // delete old
+  await prisma.ironItem.deleteMany({
+    where: { requestId }
+  });
+
+  let totalAmount = 0;
+  let totalClothes = 0;
+
+  const itemsToSave = items.map(item => {
+    const price = priceMap[item.clothType] ?? 0;
+
+    totalAmount += item.quantity * price;
+    totalClothes += item.quantity;
+
+    return {
+      requestId,
+      clothType: item.clothType,
+      quantity: item.quantity,
+      pricePerUnit: price
+    };
+  });
+
+  await prisma.ironItem.createMany({
+    data: itemsToSave
+  });
+
+  await prisma.serviceRequest.update({
+    where: { id: requestId },
+    data: {
+      totalAmount,
+      requestedClothes: totalClothes
+    }
+  });
+}
 
 module.exports = router;

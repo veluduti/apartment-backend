@@ -300,6 +300,7 @@ model ServiceRequest {
   acceptedAt DateTime?
   visitedAt  DateTime?
   quotedAt   DateTime?
+  requestEdits RequestEdit[]
 
   completedAt DateTime?
 
@@ -526,4 +527,14 @@ model PlumberQuote {
   createdAt DateTime @default(now())
 
   request ServiceRequest @relation(fields: [requestId], references: [id])
+}
+
+model RequestEdit {
+  id          String   @id @default(uuid())
+  requestId   String
+  items       Json
+  status      String   @default("PENDING")
+  createdAt   DateTime @default(now())
+
+  request     ServiceRequest @relation(fields: [requestId], references: [id])
 }

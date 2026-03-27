@@ -281,110 +281,152 @@ router.post("/book", async (req, res) => {
       return res.json({ success: false, message: "Invalid slot" });
     }
 
+    if (!items || items.length === 0) {
+      return res.json({ success: false, message: "No items selected" });
+    }
+
     let totalClothes = 0;
     let totalAmount = 0;
-    let details = "";
 
-    // 🔥 Only calculate clothes if NOT escalated
-    if (!items || items.length === 0) {
-  return res.json({ success: false, message: "No items selected" });
-}
+    // 🔥 Calculate total + validate
+    for (let item of items) {
 
-for (let item of items) {
-
-  const pricing = await prisma.ironPricing.findUnique({
-    where: {
-      apartmentId_clothType: {
-        apartmentId,
-        clothType: item.clothType
+      if (item.quantity <= 0) {
+        return res.json({
+          success: false,
+          message: "Invalid quantity"
+        });
       }
+
+      const pricing = await prisma.ironPricing.findUnique({
+        where: {
+          apartmentId_clothType: {
+            apartmentId,
+            clothType: item.clothType
+          }
+        }
+      });
+
+      if (!pricing) {
+        return res.json({
+          success: false,
+          message: `Pricing not set for ${item.clothType}`
+        });
+      }
+
+      totalClothes += item.quantity;
+      totalAmount += item.quantity * pricing.price;
     }
-  });
 
-  if (!pricing) {
-    return res.json({
-      success: false,
-      message: `Pricing not set for ${item.clothType}`
-    });
-  }
+    const details = items
+      .map(item => `${item.clothType} x${item.quantity}`)
+      .join(", ");
 
-  totalClothes += item.quantity;
-  totalAmount += item.quantity * pricing.price;
-}
+    // 🔥 Primary worker capacity check
+    if (!isEscalated && slot.usedCapacity + totalClothes > slot.maxCapacity) {
+      return res.json({
+        success: false,
+        type: "CAPACITY_FULL",
+        message: "Primary worker slot capacity exceeded"
+      });
+    }
 
-details = items
-  .map(item => `${item.clothType} x${item.quantity}`)
-  .join(", ");
+    // ==========================================
+    // 🔥 SMART WORKER ASSIGNMENT (ESCALATION)
+    // ==========================================
+    let assignedWorkerId = slot.workerId;
 
-  if (!isEscalated && slot.usedCapacity + totalClothes > slot.maxCapacity) {
-  return res.json({
-    success: false,
-    type: "CAPACITY_FULL",
-    message: "Primary worker slot capacity exceeded"
-  });
-}
+    if (isEscalated) {
 
-// ==========================================
-// 🔥 SMART WORKER ASSIGNMENT (ESCALATION)
-// ==========================================
-
-let assignedWorkerId = slot.workerId;
-
-if (isEscalated) {
-
-  // 🔹 Find other active IRON workers
-  const otherWorkers = await prisma.user.findMany({
-    where: {
-      apartmentId,
-      role: "WORKER",
-      isActive: true,
-      id: { not: slot.workerId }, // exclude primary
-      workerProfile: {
-        is: {
-          service: "IRON",
+      const otherWorkers = await prisma.user.findMany({
+        where: {
+          apartmentId,
+          role: "WORKER",
           isActive: true,
-          isAvailable: true
+          id: { not: slot.workerId },
+          workerProfile: {
+            is: {
+              service: "IRON",
+              isActive: true,
+              isAvailable: true
+            }
+          }
+        }
+      });
+
+      let found = false;
+
+      for (const worker of otherWorkers) {
+
+        const workerSlot = await prisma.pickupSlot.findFirst({
+          where: {
+            workerId: worker.id,
+            date: slot.date,
+            type: slot.type,
+            isActive: true
+          }
+        });
+
+        if (!workerSlot) continue;
+
+        const remaining =
+          workerSlot.maxCapacity - workerSlot.usedCapacity;
+
+        if (remaining >= totalClothes) {
+          assignedWorkerId = worker.id;
+          found = true;
+          break;
         }
       }
+
+      if (!found) {
+        return res.json({
+          success: false,
+          message: "No worker available with sufficient capacity"
+        });
+      }
+    }
+
+    // ==========================================
+    // 🔥 SAFE TRANSACTION (NO OVERBOOKING)
+    // ==========================================
+    await prisma.$transaction(async (tx) => {
+
+  // 🔹 Get actual assigned worker slot
+  const assignedSlot = await tx.pickupSlot.findFirst({
+    where: {
+      workerId: assignedWorkerId,
+      date: slot.date,
+      type: slot.type,
+      isActive: true
     }
   });
 
-  let found = false;
+  if (!assignedSlot) {
+    throw new Error("SLOT_NOT_FOUND");
+  }
 
-  for (const worker of otherWorkers) {
-
-    // 🔹 Find same type slot (NORMAL / URGENT)
-    const workerSlot = await prisma.pickupSlot.findFirst({
-      where: {
-        workerId: worker.id,
-        date: slot.date,
-        type: slot.type,
-        isActive: true
-      }
-    });
-
-    if (!workerSlot) continue;
-
-    const remaining =
-      workerSlot.maxCapacity - workerSlot.usedCapacity;
-
-    if (remaining >= totalClothes) {
-      assignedWorkerId = worker.id;
-      found = true;
-      break;
+  // 🔐 ATOMIC CAPACITY UPDATE (correct + safe)
+  const updateResult = await tx.pickupSlot.updateMany({
+  where: {
+    id: assignedSlot.id,
+    isActive: true,
+    usedCapacity: {
+      lte: assignedSlot.maxCapacity - totalClothes
+    }
+  },
+  data: {
+    usedCapacity: {
+      increment: totalClothes
     }
   }
+});
 
-  if (!found) {
-    return res.json({
-      success: false,
-      message: "No worker available with sufficient capacity"
-    });
+  if (updateResult.count === 0) {
+    throw new Error("CAPACITY_EXCEEDED");
   }
-}
 
-await prisma.$transaction(async (tx) => {
-
+  // ✅ Create request AFTER locking capacity
   const newRequest = await tx.serviceRequest.create({
     data: {
       apartmentId,
@@ -394,18 +436,17 @@ await prisma.$transaction(async (tx) => {
       serviceType: "IRON",
       status: "PENDING",
       details,
-      pickupSlotId: slot.id,
-      pickupDate: slot.date,
+      pickupSlotId: assignedSlot.id,
+      pickupDate: assignedSlot.date,
       bagColor,
       requestedClothes: totalClothes,
       totalAmount,
-      isEscalated: isEscalated ? true : false
+      isEscalated: Boolean(isEscalated)
     }
   });
 
-  // 🔥 ALWAYS create iron items
+  // ✅ Create items
   for (let item of items) {
-
     const pricing = await tx.ironPricing.findUnique({
       where: {
         apartmentId_clothType: {
@@ -424,27 +465,6 @@ await prisma.$transaction(async (tx) => {
       }
     });
   }
-  
-  // 🔥 Deduct capacity from the ASSIGNED worker slot
-const assignedSlot = await tx.pickupSlot.findFirst({
-  where: {
-    workerId: assignedWorkerId,
-    date: slot.date,
-    type: slot.type,
-    isActive: true
-  }
-});
-
-if (assignedSlot) {
-  await tx.pickupSlot.update({
-    where: { id: assignedSlot.id },
-    data: {
-      usedCapacity: {
-        increment: totalClothes
-      }
-    }
-  });
-}
 
 });
 
@@ -456,6 +476,20 @@ if (assignedSlot) {
     });
 
   } catch (error) {
+
+    if (error.message === "CAPACITY_EXCEEDED") {
+      return res.json({
+        success: false,
+        message: "Slot capacity exceeded"
+      });
+    }
+    if (error.message === "SLOT_NOT_FOUND") {
+      return res.json({
+        success: false,
+        message: "Slot not found"
+      });
+    }
+
     console.error("BOOK SLOT ERROR:", error);
     res.json({ success: false, message: "Server error" });
   }
@@ -739,6 +773,211 @@ router.get("/capacity", async (req, res) => {
   } catch (error) {
     console.error("CAPACITY FETCH ERROR:", error);
     res.status(500).json({ success: false });
+  }
+});
+
+router.post("/update-items", async (req, res) => {
+  try {
+
+    const { requestId, items } = req.body;
+
+    if (!requestId || !items || items.length === 0) {
+      return res.json({
+        success: false,
+        message: "Invalid data"
+      });
+    }
+
+    // 🔥 Fetch request
+    const request = await prisma.serviceRequest.findUnique({
+      where: { id: requestId },
+      include: {
+        pickupSlot: true,
+        ironItems: true
+      }
+    });
+
+    if (!request) {
+      return res.json({ success: false, message: "Request not found" });
+    }
+    // ✅ Ensure only IRON service is edited
+    if (request.serviceType !== "IRON") {
+      return res.json({
+        success: false,
+        message: "Invalid service type"
+      });
+    }
+
+    // 🔥 EDIT PERMISSION CHECK
+    if (!["PENDING", "ACCEPTED"].includes(request.status)) {
+      return res.json({
+        success: false,
+        message: "Edit not allowed in this status"
+      });
+    }
+
+    if (!request.pickupSlot) {
+      return res.json({
+        success: false,
+        message: "No slot found"
+      });
+    }
+
+    // ⏱️ TIME CHECK (30 mins before slot)
+    const now = new Date();
+    const slotStart = new Date(request.pickupSlot.startTime);
+    const cutoff = new Date(slotStart.getTime() - 30 * 60 * 1000);
+
+    if (now >= cutoff) {
+      return res.json({
+        success: false,
+        message: "Edit window closed"
+      });
+    }
+
+    // ===============================
+    // 🔥 CALCULATE NEW TOTAL
+    // ===============================
+    let totalClothes = 0;
+    let totalAmount = 0;
+
+    for (let item of items) {
+      
+      if (item.quantity <= 0) {
+        return res.json({
+          success: false,
+          message: "Invalid quantity"
+        });
+      }
+
+      const pricing = await prisma.ironPricing.findUnique({
+        where: {
+          apartmentId_clothType: {
+            apartmentId: request.apartmentId,
+            clothType: item.clothType
+          }
+        }
+      });
+
+      if (!pricing) {
+        return res.json({
+          success: false,
+          message: `Pricing not found for ${item.clothType}`
+        });
+      }
+
+      totalClothes += item.quantity;
+      totalAmount += item.quantity * pricing.price;
+    }
+
+    // ===============================
+    // 🔥 CAPACITY CHECK
+    // ===============================
+    const oldClothes = request.requestedClothes || 0;
+    const diff = totalClothes - oldClothes;
+
+    // ===============================
+    // 🔥 UPDATE DB (TRANSACTION)
+    // ===============================
+    await prisma.$transaction(async (tx) => {
+
+      // 🔹 Delete old items
+      await tx.ironItem.deleteMany({
+        where: { requestId }
+      });
+
+      // 🔹 Create new items
+      for (let item of items) {
+
+        const pricing = await tx.ironPricing.findUnique({
+          where: {
+            apartmentId_clothType: {
+              apartmentId: request.apartmentId,
+              clothType: item.clothType
+            }
+          }
+        });
+
+        await tx.ironItem.create({
+          data: {
+            requestId,
+            clothType: item.clothType,
+            quantity: item.quantity,
+            pricePerUnit: pricing.price
+          }
+        });
+      }
+
+      // 🔹 Update request totals
+      const details = items
+      .map(item => `${item.clothType} x${item.quantity}`)
+      .join(", ");
+      await tx.serviceRequest.update({
+        where: { id: requestId },
+        data: {
+          requestedClothes: totalClothes,
+          totalAmount,
+          details,
+          confirmedClothes: null
+        }
+      });
+
+      // 🔹 Update slot capacity
+      const assignedSlot = await tx.pickupSlot.findFirst({
+        where: {
+          workerId: request.workerId,
+          date: request.pickupDate,
+          type: request.pickupSlot.type,
+          isActive: true
+        }
+      });
+
+      if (assignedSlot && assignedSlot.usedCapacity + diff > assignedSlot.maxCapacity) {
+        throw new Error("CAPACITY_EXCEEDED");
+      }
+
+      if (assignedSlot) {
+        await tx.pickupSlot.update({
+          where: { id: assignedSlot.id },
+          data: {
+            usedCapacity: {
+              increment: diff
+            }
+          }
+        });
+      }
+
+      // 🔹 Update payment (if exists)
+      await tx.payment.updateMany({
+        where: { requestId },
+        data: {
+          amount: totalAmount
+        }
+      });
+
+    });
+
+    // ===============================
+    // 🔔 SOCKET NOTIFY
+    // ===============================
+    const io = req.app.get("io");
+    io.to(request.workerId).emit("requestUpdated", { requestId });
+
+    return res.json({
+      success: true,
+      message: "Items updated successfully"
+    });
+
+  } catch (error) {
+    if (error.message === "CAPACITY_EXCEEDED") {
+  return res.json({
+    success: false,
+    message: "Slot capacity exceeded"
+  });
+}
+
+console.error("UPDATE ITEMS ERROR:", error);
+res.status(500).json({ success: false });
   }
 });
 
